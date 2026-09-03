@@ -18,5 +18,12 @@
 	"ai": {
 		"binding": "AI"
 	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "llm-chat-history",
+			"database_id": "a69fd678-ef5d-4ffd-a0ca-4610835a3f81"
+		}
+	],
 	"upload_source_maps": true
 }
