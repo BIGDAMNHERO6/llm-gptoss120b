@@ -1,26 +1,11 @@
-/**
- * LLM Chat Application Template
- *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
- *
- * @license MIT
- */
 import { Env, ChatMessage } from "./types";
 
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
 const MODEL_ID = "@cf/openai/gpt-oss-120b";
 
-// Default system prompt
 const SYSTEM_PROMPT =
-	"You are a helpful, friendly assistant. Provide concise and accurate responses.";
+	"You are a personal AI assistant powered by OpenAI gpt-oss-120b running on Cloudflare Workers AI. Be concise, accurate, and helpful.";
 
 export default {
-	/**
-	 * Main request handler for the Worker
-	 */
 	async fetch(
 		request: Request,
 		env: Env,
@@ -28,61 +13,91 @@ export default {
 	): Promise<Response> {
 		const url = new URL(request.url);
 
-		// Handle static assets (frontend)
+		// Serve the website
 		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
 			return env.ASSETS.fetch(request);
 		}
 
-		// API Routes
-		if (url.pathname === "/api/chat") {
-			// Handle POST requests for chat
-			if (request.method === "POST") {
-				return handleChatRequest(request, env);
-			}
+		// Load saved chat history
+		if (url.pathname === "/api/history" && request.method === "GET") {
+			try {
+				const result = await env.DB.prepare(
+					`SELECT role, content, created_at
+					 FROM chats
+					 ORDER BY id ASC
+					 LIMIT 500`,
+				).all();
 
-			// Method not allowed for other request types
-			return new Response("Method not allowed", { status: 405 });
+				return Response.json(result.results);
+			} catch (error) {
+				console.error("Failed to load history:", error);
+				return Response.json([], { status: 500 });
+			}
 		}
 
-		// Handle 404 for unmatched routes
+		// Chat endpoint
+		if (url.pathname === "/api/chat" && request.method === "POST") {
+			return handleChatRequest(request, env, ctx);
+		}
+
 		return new Response("Not found", { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
 
-/**
- * Handles chat API requests
- */
 async function handleChatRequest(
 	request: Request,
 	env: Env,
+	ctx: ExecutionContext,
 ): Promise<Response> {
 	try {
-		// Parse JSON request body
-		const { messages = [] } = (await request.json()) as {
-			messages: ChatMessage[];
+		const body = (await request.json()) as {
+			messages?: ChatMessage[];
 		};
 
-		// Add system prompt if not present
-		if (!messages.some((msg) => msg.role === "system")) {
-			messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+		const messages = body.messages ?? [];
+
+		// Save the newest user message
+		const lastUserMessage = [...messages]
+			.reverse()
+			.find((message) => message.role === "user");
+
+		if (lastUserMessage) {
+			await env.DB.prepare(
+				"INSERT INTO chats (role, content) VALUES (?, ?)",
+			)
+				.bind("user", lastUserMessage.content)
+				.run();
+		}
+
+		// Send a copy to the model
+		const modelMessages: ChatMessage[] = [...messages];
+
+		if (!modelMessages.some((message) => message.role === "system")) {
+			modelMessages.unshift({
+				role: "system",
+				content: SYSTEM_PROMPT,
+			});
 		}
 
 		const inputs = {
-			messages,
+			messages: modelMessages,
 			max_tokens: 1024,
 			stream: true,
 		} satisfies AiTextGenerationInput & { stream: true };
 
-		const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, inputs, {
-			// Uncomment to use AI Gateway
-			// gateway: {
-			//   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-			//   skipCache: false,      // Set to true to bypass cache
-			//   cacheTtl: 3600,        // Cache time-to-live in seconds
-			// },
-		});
+		const aiStream = await env.AI.run<typeof MODEL_ID>(
+			MODEL_ID,
+			inputs,
+		);
 
-		return new Response(stream, {
+		// Split the stream:
+		// one copy goes to your browser,
+		// the other is saved into D1.
+		const [browserStream, databaseStream] = aiStream.tee();
+
+		ctx.waitUntil(saveAssistantResponse(databaseStream, env.DB));
+
+		return new Response(browserStream, {
 			headers: {
 				"content-type": "text/event-stream; charset=utf-8",
 				"cache-control": "no-cache",
@@ -90,13 +105,77 @@ async function handleChatRequest(
 			},
 		});
 	} catch (error) {
-		console.error("Error processing chat request:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to process request" }),
-			{
-				status: 500,
-				headers: { "content-type": "application/json" },
-			},
+		console.error("Chat error:", error);
+
+		return Response.json(
+			{ error: "Failed to process request" },
+			{ status: 500 },
 		);
+	}
+}
+
+async function saveAssistantResponse(
+	stream: ReadableStream,
+	db: D1Database,
+): Promise<void> {
+	try {
+		const reader = stream.getReader();
+		const decoder = new TextDecoder();
+
+		let buffer = "";
+		let fullResponse = "";
+
+		const processEvents = () => {
+			buffer = buffer.replace(/\r/g, "");
+
+			let eventEnd;
+
+			while ((eventEnd = buffer.indexOf("\n\n")) !== -1) {
+				const rawEvent = buffer.slice(0, eventEnd);
+				buffer = buffer.slice(eventEnd + 2);
+
+				const data = rawEvent
+					.split("\n")
+					.filter((line) => line.startsWith("data:"))
+					.map((line) => line.slice(5).trimStart())
+					.join("\n");
+
+				if (!data || data === "[DONE]") continue;
+
+				try {
+					const parsed = JSON.parse(data);
+
+					if (typeof parsed.response === "string") {
+						fullResponse += parsed.response;
+					} else if (parsed.choices?.[0]?.delta?.content) {
+						fullResponse += parsed.choices[0].delta.content;
+					}
+				} catch {
+					// Ignore incomplete/non-JSON SSE events
+				}
+			}
+		};
+
+		while (true) {
+			const { done, value } = await reader.read();
+
+			if (done) break;
+
+			buffer += decoder.decode(value, { stream: true });
+			processEvents();
+		}
+
+		buffer += decoder.decode();
+		buffer += "\n\n";
+		processEvents();
+
+		if (fullResponse.trim()) {
+			await db
+				.prepare("INSERT INTO chats (role, content) VALUES (?, ?)")
+				.bind("assistant", fullResponse)
+				.run();
+		}
+	} catch (error) {
+		console.error("Failed to save assistant response:", error);
 	}
 }
