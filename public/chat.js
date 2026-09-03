@@ -1,88 +1,236 @@
-// DOM elements
 const chatMessages = document.getElementById("chat-messages");
 const userInput = document.getElementById("user-input");
 const sendButton = document.getElementById("send-button");
 const typingIndicator = document.getElementById("typing-indicator");
+const conversationList = document.getElementById("conversation-list");
+const newChatButton = document.getElementById("new-chat-button");
+const chatTitle = document.getElementById("chat-title");
+const sidebar = document.getElementById("sidebar");
+const mobileSidebarButton = document.getElementById("mobile-sidebar-button");
 
-// Current conversation
-let chatHistory = [];
+let currentConversationId = null;
+let conversations = [];
 let isProcessing = false;
 
-// Start app
-loadHistory();
 
-// Auto-resize textbox
+// START APP
+initializeApp();
+
+
+// TEXT BOX
 userInput.addEventListener("input", function () {
 	this.style.height = "auto";
-	this.style.height = this.scrollHeight + "px";
+	this.style.height = Math.min(this.scrollHeight, 180) + "px";
 });
 
-// Press Enter to send
-userInput.addEventListener("keydown", function (e) {
-	if (e.key === "Enter" && !e.shiftKey) {
-		e.preventDefault();
+userInput.addEventListener("keydown", function (event) {
+	if (event.key === "Enter" && !event.shiftKey) {
+		event.preventDefault();
 		sendMessage();
 	}
 });
 
 sendButton.addEventListener("click", sendMessage);
 
-// Load saved messages from Cloudflare D1
-async function loadHistory() {
-	try {
-		const response = await fetch("/api/history");
 
-		if (!response.ok) {
-			throw new Error("Could not load chat history");
+// NEW CHAT
+newChatButton.addEventListener("click", async () => {
+	if (isProcessing) return;
+
+	await createNewConversation();
+
+	if (window.innerWidth <= 700) {
+		sidebar.classList.remove("open");
+	}
+});
+
+
+// MOBILE SIDEBAR
+mobileSidebarButton.addEventListener("click", () => {
+	sidebar.classList.toggle("open");
+});
+
+
+// INITIALIZE
+async function initializeApp() {
+	try {
+		await loadConversations();
+
+		if (conversations.length === 0) {
+			await createNewConversation();
+			return;
 		}
 
-		const savedMessages = await response.json();
+		const rememberedId = localStorage.getItem("activeConversationId");
 
-		// Remove the template greeting already in the HTML
-		chatMessages.innerHTML = "";
+		const rememberedConversation = conversations.find(
+			(conversation) => conversation.id === rememberedId
+		);
 
-		if (Array.isArray(savedMessages) && savedMessages.length > 0) {
-			chatHistory = savedMessages
-				.filter(
-					(message) =>
-						message.role === "user" ||
-						message.role === "assistant",
-				)
-				.map((message) => ({
-					role: message.role,
-					content: message.content,
-				}));
-
-			for (const message of chatHistory) {
-				addMessageToChat(message.role, message.content);
-			}
+		if (rememberedConversation) {
+			await openConversation(rememberedConversation.id);
 		} else {
-			showWelcomeMessage();
+			await openConversation(conversations[0].id);
 		}
 	} catch (error) {
-		console.error("History load error:", error);
-
-		chatMessages.innerHTML = "";
-		showWelcomeMessage();
+		console.error("Initialization error:", error);
+		showEmptyChat();
 	}
 }
 
-function showWelcomeMessage() {
+
+// LOAD SIDEBAR
+async function loadConversations() {
+	const response = await fetch("/api/conversations");
+
+	if (!response.ok) {
+		throw new Error("Could not load conversations");
+	}
+
+	const result = await response.json();
+
+	conversations = Array.isArray(result) ? result : [];
+
+	renderConversationList();
+}
+
+
+// RENDER SIDEBAR
+function renderConversationList() {
+	conversationList.innerHTML = "";
+
+	for (const conversation of conversations) {
+		const item = document.createElement("div");
+
+		item.className = "conversation-item";
+
+		if (conversation.id === currentConversationId) {
+			item.classList.add("active");
+		}
+
+		item.textContent = conversation.title || "New Chat";
+		item.title = conversation.title || "New Chat";
+
+		item.addEventListener("click", async () => {
+			if (isProcessing) return;
+
+			await openConversation(conversation.id);
+
+			if (window.innerWidth <= 700) {
+				sidebar.classList.remove("open");
+			}
+		});
+
+		conversationList.appendChild(item);
+	}
+}
+
+
+// CREATE NEW CHAT
+async function createNewConversation() {
+	try {
+		const response = await fetch("/api/conversations", {
+			method: "POST",
+		});
+
+		if (!response.ok) {
+			throw new Error("Could not create conversation");
+		}
+
+		const conversation = await response.json();
+
+		currentConversationId = conversation.id;
+
+		localStorage.setItem(
+			"activeConversationId",
+			currentConversationId
+		);
+
+		await loadConversations();
+		await openConversation(currentConversationId);
+
+		userInput.focus();
+	} catch (error) {
+		console.error("New conversation error:", error);
+	}
+}
+
+
+// OPEN CHAT
+async function openConversation(conversationId) {
+	currentConversationId = conversationId;
+
+	localStorage.setItem(
+		"activeConversationId",
+		currentConversationId
+	);
+
+	const conversation = conversations.find(
+		(item) => item.id === conversationId
+	);
+
+	chatTitle.textContent = conversation?.title || "New Chat";
+
+	renderConversationList();
+
+	chatMessages.innerHTML = "";
+
+	try {
+		const response = await fetch(
+			`/api/conversations/${encodeURIComponent(conversationId)}/messages`
+		);
+
+		if (!response.ok) {
+			throw new Error("Could not load messages");
+		}
+
+		const messages = await response.json();
+
+		if (Array.isArray(messages) && messages.length > 0) {
+			for (const message of messages) {
+				addMessageToChat(
+					message.role,
+					message.content
+				);
+			}
+		} else {
+			showEmptyChat();
+		}
+	} catch (error) {
+		console.error("Message loading error:", error);
+		showEmptyChat();
+	}
+
+	userInput.focus();
+}
+
+
+// EMPTY CHAT
+function showEmptyChat() {
+	chatMessages.innerHTML = "";
+
 	addMessageToChat(
 		"assistant",
-		"Hello! I'm your personal AI assistant powered by gpt-oss-120b. How can I help you?",
+		"Hello! I'm your personal AI assistant powered by gpt-oss-120b. How can I help you?"
 	);
 }
 
-// Send message
+
+// SEND MESSAGE
 async function sendMessage() {
 	const message = userInput.value.trim();
 
 	if (!message || isProcessing) return;
 
+	if (!currentConversationId) {
+		await createNewConversation();
+	}
+
 	isProcessing = true;
+
 	userInput.disabled = true;
 	sendButton.disabled = true;
+	newChatButton.disabled = true;
 
 	addMessageToChat("user", message);
 
@@ -91,54 +239,52 @@ async function sendMessage() {
 
 	typingIndicator.classList.add("visible");
 
-	chatHistory.push({
-		role: "user",
-		content: message,
-	});
-
 	try {
-		const assistantMessageEl = document.createElement("div");
-		assistantMessageEl.className =
-			"message assistant-message";
+		const assistantMessage = document.createElement("div");
+		assistantMessage.className = "message assistant-message";
 
-		const assistantTextEl = document.createElement("p");
-		assistantMessageEl.appendChild(assistantTextEl);
+		const assistantText = document.createElement("p");
 
-		chatMessages.appendChild(assistantMessageEl);
-		chatMessages.scrollTop = chatMessages.scrollHeight;
+		assistantMessage.appendChild(assistantText);
+		chatMessages.appendChild(assistantMessage);
 
-		const response = await fetch("/api/chat", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				// Keep recent conversation context manageable
-				messages: chatHistory.slice(-40),
-			}),
-		});
+		scrollToBottom();
+
+		const response = await fetch(
+			`/api/conversations/${encodeURIComponent(currentConversationId)}/chat`,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					message: message,
+				}),
+			}
+		);
 
 		if (!response.ok) {
-			throw new Error("Failed to get AI response");
+			throw new Error("AI request failed");
 		}
 
 		if (!response.body) {
-			throw new Error("Response stream unavailable");
+			throw new Error("No response stream");
 		}
 
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
 
-		let responseText = "";
 		let buffer = "";
+		let responseText = "";
 		let finished = false;
 
 		while (!finished) {
 			const { done, value } = await reader.read();
 
 			if (done) {
+				buffer += decoder.decode();
 				buffer += "\n\n";
-				processBuffer();
+				processStreamBuffer();
 				break;
 			}
 
@@ -146,10 +292,10 @@ async function sendMessage() {
 				stream: true,
 			});
 
-			processBuffer();
+			processStreamBuffer();
 		}
 
-		function processBuffer() {
+		function processStreamBuffer() {
 			buffer = buffer.replace(/\r/g, "");
 
 			let eventEnd;
@@ -164,7 +310,7 @@ async function sendMessage() {
 					.split("\n")
 					.filter((line) => line.startsWith("data:"))
 					.map((line) =>
-						line.slice(5).trimStart(),
+						line.slice(5).trimStart()
 					)
 					.join("\n");
 
@@ -193,54 +339,85 @@ async function sendMessage() {
 
 					if (content) {
 						responseText += content;
-						assistantTextEl.textContent =
+						assistantText.textContent =
 							responseText;
 
-						chatMessages.scrollTop =
-							chatMessages.scrollHeight;
+						scrollToBottom();
 					}
 				} catch (error) {
 					console.error(
-						"Streaming parse error:",
-						error,
+						"Stream parsing error:",
+						error
 					);
 				}
 			}
 		}
 
-		if (responseText.trim()) {
-			chatHistory.push({
-				role: "assistant",
-				content: responseText,
-			});
+		if (!responseText.trim()) {
+			assistantMessage.remove();
+
+			addMessageToChat(
+				"assistant",
+				"I didn't receive a response. Please try again."
+			);
 		}
+
+		// Reload sidebar so the new automatic chat title appears
+		await loadConversations();
+
+		const activeConversation = conversations.find(
+			(item) =>
+				item.id === currentConversationId
+		);
+
+		if (activeConversation) {
+			chatTitle.textContent =
+				activeConversation.title;
+		}
+
+		renderConversationList();
+
 	} catch (error) {
 		console.error("Chat error:", error);
 
 		addMessageToChat(
 			"assistant",
-			"Sorry, something went wrong.",
+			"Sorry, something went wrong. Please try again."
 		);
 	} finally {
 		typingIndicator.classList.remove("visible");
 
 		isProcessing = false;
+
 		userInput.disabled = false;
 		sendButton.disabled = false;
+		newChatButton.disabled = false;
+
 		userInput.focus();
 	}
 }
 
-// Display message safely
+
+// DISPLAY MESSAGE
 function addMessageToChat(role, content) {
-	const messageEl = document.createElement("div");
-	messageEl.className = `message ${role}-message`;
+	const message = document.createElement("div");
 
-	const textEl = document.createElement("p");
-	textEl.textContent = content;
+	message.className =
+		`message ${role}-message`;
 
-	messageEl.appendChild(textEl);
-	chatMessages.appendChild(messageEl);
+	const text = document.createElement("p");
 
-	chatMessages.scrollTop = chatMessages.scrollHeight;
+	text.textContent = content;
+
+	message.appendChild(text);
+	chatMessages.appendChild(message);
+
+	scrollToBottom();
+}
+
+
+// SCROLL
+function scrollToBottom() {
+	chatMessages.scrollTop =
+		chatMessages.scrollHeight;
 }
