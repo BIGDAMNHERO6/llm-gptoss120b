@@ -13,99 +13,216 @@ export default {
 	): Promise<Response> {
 		const url = new URL(request.url);
 
-		// Serve the website
 		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
 			return env.ASSETS.fetch(request);
 		}
 
-		// Load saved chat history
+		// OLD chat history - kept temporarily so nothing breaks
 		if (url.pathname === "/api/history" && request.method === "GET") {
-			try {
+			const result = await env.DB.prepare(
+				`SELECT role, content, created_at
+				 FROM chats
+				 ORDER BY id ASC
+				 LIMIT 500`,
+			).all();
+
+			return Response.json(result.results);
+		}
+
+		// Get all conversations
+		if (
+			url.pathname === "/api/conversations" &&
+			request.method === "GET"
+		) {
+			const result = await env.DB.prepare(
+				`SELECT id, title, created_at, updated_at
+				 FROM conversations
+				 ORDER BY updated_at DESC`,
+			).all();
+
+			return Response.json(result.results);
+		}
+
+		// Create a new conversation
+		if (
+			url.pathname === "/api/conversations" &&
+			request.method === "POST"
+		) {
+			const id = crypto.randomUUID();
+
+			await env.DB.prepare(
+				`INSERT INTO conversations (id, title)
+				 VALUES (?, ?)`,
+			)
+				.bind(id, "New Chat")
+				.run();
+
+			return Response.json({
+				id,
+				title: "New Chat",
+			});
+		}
+
+		// Routes for one specific conversation
+		const match = url.pathname.match(
+			/^\/api\/conversations\/([^/]+)\/(messages|chat)$/,
+		);
+
+		if (match) {
+			const conversationId = match[1];
+			const action = match[2];
+
+			if (action === "messages" && request.method === "GET") {
 				const result = await env.DB.prepare(
 					`SELECT role, content, created_at
-					 FROM chats
-					 ORDER BY id ASC
-					 LIMIT 500`,
-				).all();
+					 FROM messages
+					 WHERE conversation_id = ?
+					 ORDER BY id ASC`,
+				)
+					.bind(conversationId)
+					.all();
 
 				return Response.json(result.results);
-			} catch (error) {
-				console.error("Failed to load history:", error);
-				return Response.json([], { status: 500 });
+			}
+
+			if (action === "chat" && request.method === "POST") {
+				return handleConversationChat(
+					request,
+					env,
+					ctx,
+					conversationId,
+				);
 			}
 		}
 
-		// Chat endpoint
+		// OLD chat endpoint - kept temporarily
 		if (url.pathname === "/api/chat" && request.method === "POST") {
-			return handleChatRequest(request, env, ctx);
+			return handleOldChat(request, env, ctx);
 		}
 
 		return new Response("Not found", { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
 
-async function handleChatRequest(
+async function handleConversationChat(
 	request: Request,
 	env: Env,
 	ctx: ExecutionContext,
+	conversationId: string,
 ): Promise<Response> {
 	try {
 		const body = (await request.json()) as {
-			messages?: ChatMessage[];
+			message?: string;
 		};
 
-		const messages = body.messages ?? [];
+		const userMessage = body.message?.trim();
 
-		// Save the newest user message
-		const lastUserMessage = [...messages]
-			.reverse()
-			.find((message) => message.role === "user");
+		if (!userMessage) {
+			return Response.json(
+				{ error: "Message is required" },
+				{ status: 400 },
+			);
+		}
 
-		if (lastUserMessage) {
+		// Make sure conversation exists
+		const conversation = await env.DB.prepare(
+			"SELECT id, title FROM conversations WHERE id = ?",
+		)
+			.bind(conversationId)
+			.first<{ id: string; title: string }>();
+
+		if (!conversation) {
+			return Response.json(
+				{ error: "Conversation not found" },
+				{ status: 404 },
+			);
+		}
+
+		// Save user message
+		await env.DB.prepare(
+			`INSERT INTO messages
+			 (conversation_id, role, content)
+			 VALUES (?, ?, ?)`,
+		)
+			.bind(conversationId, "user", userMessage)
+			.run();
+
+		// Automatically name a new chat from the first message
+		if (conversation.title === "New Chat") {
+			const title =
+				userMessage.length > 45
+					? userMessage.slice(0, 45) + "..."
+					: userMessage;
+
 			await env.DB.prepare(
-				"INSERT INTO chats (role, content) VALUES (?, ?)",
+				`UPDATE conversations
+				 SET title = ?, updated_at = CURRENT_TIMESTAMP
+				 WHERE id = ?`,
 			)
-				.bind("user", lastUserMessage.content)
+				.bind(title, conversationId)
+				.run();
+		} else {
+			await env.DB.prepare(
+				`UPDATE conversations
+				 SET updated_at = CURRENT_TIMESTAMP
+				 WHERE id = ?`,
+			)
+				.bind(conversationId)
 				.run();
 		}
 
-		// Send a copy to the model
-		const modelMessages: ChatMessage[] = [...messages];
+		// Load recent context
+		const history = await env.DB.prepare(
+			`SELECT role, content
+			 FROM (
+				SELECT id, role, content
+				FROM messages
+				WHERE conversation_id = ?
+				ORDER BY id DESC
+				LIMIT 40
+			 )
+			 ORDER BY id ASC`,
+		)
+			.bind(conversationId)
+			.all<ChatMessage>();
 
-		if (!modelMessages.some((message) => message.role === "system")) {
-			modelMessages.unshift({
+		const modelMessages: ChatMessage[] = [
+			{
 				role: "system",
 				content: SYSTEM_PROMPT,
-			});
-		}
-
-		const inputs = {
-			messages: modelMessages,
-			max_tokens: 1024,
-			stream: true,
-		} satisfies AiTextGenerationInput & { stream: true };
+			},
+			...(history.results as ChatMessage[]),
+		];
 
 		const aiStream = await env.AI.run<typeof MODEL_ID>(
 			MODEL_ID,
-			inputs,
+			{
+				messages: modelMessages,
+				max_tokens: 1024,
+				stream: true,
+			},
 		);
 
-		// Split the stream:
-		// one copy goes to your browser,
-		// the other is saved into D1.
 		const [browserStream, databaseStream] = aiStream.tee();
 
-		ctx.waitUntil(saveAssistantResponse(databaseStream, env.DB));
+		ctx.waitUntil(
+			saveAssistantResponse(
+				databaseStream,
+				env.DB,
+				conversationId,
+			),
+		);
 
 		return new Response(browserStream, {
 			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
+				"content-type":
+					"text/event-stream; charset=utf-8",
 				"cache-control": "no-cache",
 				connection: "keep-alive",
 			},
 		});
 	} catch (error) {
-		console.error("Chat error:", error);
+		console.error(error);
 
 		return Response.json(
 			{ error: "Failed to process request" },
@@ -114,68 +231,144 @@ async function handleChatRequest(
 	}
 }
 
+// Temporary old chat system
+async function handleOldChat(
+	request: Request,
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<Response> {
+	const body = (await request.json()) as {
+		messages?: ChatMessage[];
+	};
+
+	const messages = body.messages ?? [];
+
+	const lastUserMessage = [...messages]
+		.reverse()
+		.find((message) => message.role === "user");
+
+	if (lastUserMessage) {
+		await env.DB.prepare(
+			"INSERT INTO chats (role, content) VALUES (?, ?)",
+		)
+			.bind("user", lastUserMessage.content)
+			.run();
+	}
+
+	const modelMessages = [...messages];
+
+	modelMessages.unshift({
+		role: "system",
+		content: SYSTEM_PROMPT,
+	});
+
+	const aiStream = await env.AI.run<typeof MODEL_ID>(
+		MODEL_ID,
+		{
+			messages: modelMessages,
+			max_tokens: 1024,
+			stream: true,
+		},
+	);
+
+	const [browserStream, databaseStream] = aiStream.tee();
+
+	ctx.waitUntil(saveOldResponse(databaseStream, env.DB));
+
+	return new Response(browserStream, {
+		headers: {
+			"content-type": "text/event-stream; charset=utf-8",
+			"cache-control": "no-cache",
+			connection: "keep-alive",
+		},
+	});
+}
+
+async function readAIStream(stream: ReadableStream): Promise<string> {
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+
+	let buffer = "";
+	let fullResponse = "";
+
+	const processEvents = () => {
+		buffer = buffer.replace(/\r/g, "");
+
+		let end;
+
+		while ((end = buffer.indexOf("\n\n")) !== -1) {
+			const event = buffer.slice(0, end);
+			buffer = buffer.slice(end + 2);
+
+			const data = event
+				.split("\n")
+				.filter((line) => line.startsWith("data:"))
+				.map((line) => line.slice(5).trimStart())
+				.join("\n");
+
+			if (!data || data === "[DONE]") continue;
+
+			try {
+				const parsed = JSON.parse(data);
+
+				if (typeof parsed.response === "string") {
+					fullResponse += parsed.response;
+				} else if (
+					parsed.choices?.[0]?.delta?.content
+				) {
+					fullResponse +=
+						parsed.choices[0].delta.content;
+				}
+			} catch {}
+		}
+	};
+
+	while (true) {
+		const { done, value } = await reader.read();
+
+		if (done) break;
+
+		buffer += decoder.decode(value, { stream: true });
+		processEvents();
+	}
+
+	buffer += "\n\n";
+	processEvents();
+
+	return fullResponse;
+}
+
 async function saveAssistantResponse(
 	stream: ReadableStream,
 	db: D1Database,
-): Promise<void> {
-	try {
-		const reader = stream.getReader();
-		const decoder = new TextDecoder();
+	conversationId: string,
+) {
+	const response = await readAIStream(stream);
 
-		let buffer = "";
-		let fullResponse = "";
+	if (!response.trim()) return;
 
-		const processEvents = () => {
-			buffer = buffer.replace(/\r/g, "");
+	await db
+		.prepare(
+			`INSERT INTO messages
+			 (conversation_id, role, content)
+			 VALUES (?, ?, ?)`,
+		)
+		.bind(conversationId, "assistant", response)
+		.run();
+}
 
-			let eventEnd;
+async function saveOldResponse(
+	stream: ReadableStream,
+	db: D1Database,
+) {
+	const response = await readAIStream(stream);
 
-			while ((eventEnd = buffer.indexOf("\n\n")) !== -1) {
-				const rawEvent = buffer.slice(0, eventEnd);
-				buffer = buffer.slice(eventEnd + 2);
+	if (!response.trim()) return;
 
-				const data = rawEvent
-					.split("\n")
-					.filter((line) => line.startsWith("data:"))
-					.map((line) => line.slice(5).trimStart())
-					.join("\n");
-
-				if (!data || data === "[DONE]") continue;
-
-				try {
-					const parsed = JSON.parse(data);
-
-					if (typeof parsed.response === "string") {
-						fullResponse += parsed.response;
-					} else if (parsed.choices?.[0]?.delta?.content) {
-						fullResponse += parsed.choices[0].delta.content;
-					}
-				} catch {
-					// Ignore incomplete/non-JSON SSE events
-				}
-			}
-		};
-
-		while (true) {
-			const { done, value } = await reader.read();
-
-			if (done) break;
-
-			buffer += decoder.decode(value, { stream: true });
-			processEvents();
-		}
-
-		buffer += decoder.decode();
-		buffer += "\n\n";
-		processEvents();
-
-		if (fullResponse.trim()) {
-			await db
-				.prepare("INSERT INTO chats (role, content) VALUES (?, ?)")
-				.bind("assistant", fullResponse)
-				.run();
-		}
-	} catch (error) {
-		console.error("Failed to save assistant response:", error);
-	}
+	await db
+		.prepare(
+			"INSERT INTO chats (role, content) VALUES (?, ?)",
+		)
+		.bind("assistant", response)
+		.run();
 }
